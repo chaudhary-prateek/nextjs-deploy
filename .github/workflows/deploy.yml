@@ -1,0 +1,68 @@
+name: Build and Deploy Next.js App via ECR
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag and push Docker image to ECR
+        env:
+          ECR_REPO: ${{ secrets.ECR_REPO }}
+        run: |
+          IMAGE_TAG=$(date +%s)  # simple tag (timestamp)
+          docker build -t $ECR_REPO:$IMAGE_TAG .
+          docker push $ECR_REPO:$IMAGE_TAG
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Add SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
+          chmod 600 key.pem
+
+      - name: Deploy on EC2
+        env:
+          ECR_REPO: ${{ secrets.ECR_REPO }}
+        run: |
+          ssh -i key.pem -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << EOF
+            set -e
+            export AWS_REGION="${{ secrets.AWS_REGION }}"
+            export IMAGE_TAG="${{ env.IMAGE_TAG }}"
+            export ECR_REPO="${{ secrets.ECR_REPO }}"
+            aws ecr get-login-password --region \$AWS_REGION | docker login --username AWS --password-stdin \$ECR_REPO
+            cd ${{ secrets.APP_DIR }}
+
+            echo "⏮️ Backing up current container..."
+            if docker inspect nextjs-app &> /dev/null; then
+              docker commit nextjs-app nextjs-app:backup || true
+            fi
+
+            echo "⬇️ Pulling new image..."
+            docker pull \$ECR_REPO:\$IMAGE_TAG
+
+            echo "🚀 Running new container..."
+            docker stop nextjs-app || true
+            docker rm nextjs-app || true
+            docker run -d --name nextjs-app -p 3000:3000 \$ECR_REPO:\$IMAGE_TAG || {
+              echo "❌ Deployment failed! Rolling back..."
+              docker run -d --name nextjs-app -p 3000:3000 nextjs-app:backup
+            }
+          EOF
